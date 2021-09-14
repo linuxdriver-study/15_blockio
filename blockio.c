@@ -39,7 +39,7 @@ struct keyirq_device_struct {
         struct irq_keydesc keyirq[KEY_NUM];
         struct timer_list timer;
         atomic_t releasekey;
-        wait_queue_head_t wait;
+        wait_queue_head_t r_wait;
 };
 static struct keyirq_device_struct keyirq_dev;
 
@@ -71,9 +71,25 @@ static ssize_t keyirq_read(struct file *file,
         int ret = 0;
         int releasekey = 0;
         struct keyirq_device_struct *dev = file->private_data;
-        
-        wait_event(dev->wait, atomic_read(&dev->releasekey));
-        releasekey = atomic_read(&dev->releasekey);
+#if 0
+        //wait_event(dev->r_wait, atomic_read(&dev->releasekey));
+        ret = wait_event_interruptible(dev->r_wait, atomic_read(&dev->releasekey));
+        if (ret)
+                goto error;
+#endif
+        DECLARE_WAITQUEUE(wait, current);               /* 定义一个等待队列 */
+        add_wait_queue(&dev->r_wait, &wait);            /* 将队列项添加到等待队列头 */
+        __set_current_state(TASK_INTERRUPTIBLE);        /* 设置进入为可被打断状态 */
+        schedule();                                     /* 切换 */
+
+        if (signal_pending(current)) {
+                ret = -ERESTARTSYS;
+                goto error;
+        }
+        __set_current_state(TASK_RUNNING);              /* 将当前任务设置为运行状态 */
+        remove_wait_queue(&dev->r_wait, &wait);         /* 将对应的队列项从等待队列头删除 */
+
+        releasekey = atomic_read(&dev->releasekey); 
 
         if (releasekey == 1) {
                 atomic_set(&dev->releasekey, 0);
@@ -84,8 +100,12 @@ static ssize_t keyirq_read(struct file *file,
                 }
                 ret = sizeof(releasekey);
         }
+        goto out;
 
 error:
+        __set_current_state(TASK_RUNNING);              /* 将当前任务设置为运行状态 */
+        remove_wait_queue(&dev->r_wait, &wait);         /* 将对应的队列项从等待队列头删除 */
+out:
         return ret;
 }
 
@@ -106,8 +126,9 @@ void timer_func(unsigned long arg)
                 //printk("KEY0 Press!\n");
         } else if (value == 1) {
                 //printk("KEY0 Release!\n");
+                wake_up(&dev->r_wait);
         }
-        wake_up(&dev->wait);
+        //wake_up(&dev->r_wait);
 }
 
 static irqreturn_t key0_handler(int irq, void *dev_id)
@@ -242,7 +263,7 @@ static int __init keyirq_init(void)
         }
 
         atomic_set(&keyirq_dev.releasekey, 0);
-        init_waitqueue_head(&keyirq_dev.wait);
+        init_waitqueue_head(&keyirq_dev.r_wait);
 
         init_timer(&keyirq_dev.timer);
         keyirq_dev.timer.function = timer_func;
